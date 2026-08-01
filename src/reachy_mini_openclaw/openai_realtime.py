@@ -139,6 +139,9 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         # Running estimate of how loud the robot's own voice comes back into
         # its microphone, used to tell echo apart from someone talking over it.
         self._echo_rms = 0.0
+        # Optional direct MCP server, set up by start_mcp().
+        self.mcp: Optional[Any] = None
+        self._mcp_tool_names: set[str] = set()
         
         # OpenClaw agent context (fetched at startup)
         self._agent_context: Optional[str] = None
@@ -158,11 +161,15 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
     def _build_tools(self) -> list[dict]:
         """Build the tool list for the session."""
         tools = []
-        
+
         # Robot movement tools (executed locally)
         for spec in get_tool_specs():
             tools.append(spec)
-        
+
+        # Domain tools served straight from the MCP server, no agent turn.
+        for spec in self._mcp_tool_specs():
+            tools.append(spec)
+
         # OpenClaw query tool (for extended capabilities)
         if self.openclaw_bridge is not None:
             tools.append({
@@ -241,10 +248,14 @@ OpenClaw has access to many capabilities you don't have directly.""",
         """Run a single OpenAI Realtime session."""
         model = config.OPENAI_MODEL
         logger.info("Connecting to OpenAI Realtime API with model: %s", model)
-        
-        # Fetch OpenClaw agent context (personality, memories, user info)
-        system_instructions = await self._build_system_instructions()
-        
+
+        # Start with the built-in identity so the robot can listen right away.
+        # Fetching the OpenClaw personality is a full agent turn — tens of
+        # seconds — and it used to sit between "Ready!" and the first word the
+        # robot could hear. It is applied through a second session.update as
+        # soon as it lands.
+        system_instructions = self._compose_instructions(FALLBACK_IDENTITY)
+
         # GA Realtime API (/v1/realtime). The beta surface this code targeted is
         # switched off server-side: it answers `beta_api_shape_disabled`.
         async with self.client.realtime.connect(model=model) as conn:
@@ -272,7 +283,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
                                 "type": "server_vad",
                                 "threshold": 0.5,
                                 "prefix_padding_ms": 300,
-                                "silence_duration_ms": 600,
+                                "silence_duration_ms": config.VAD_SILENCE_MS,
                             },
                         },
                         "output": {
@@ -285,55 +296,164 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 },
             )
             logger.info("OpenAI Realtime session configured with %d tools", len(tools))
-            
+
             self.connection = conn
             self._connected_event.set()
-            
-            # Process events
-            async for event in conn:
-                await self._handle_event(event)
-    
-    async def _build_system_instructions(self) -> str:
-        """Build system instructions by fetching OpenClaw's context.
-        
-        Returns:
-            Complete system instructions combining OpenClaw identity + robot capabilities
-        """
-        # Try to fetch context from OpenClaw.
-        # This is a full OpenClaw agent turn, so it is as slow as whatever
-        # model that agent runs — and it sits between "Ready!" and the first
-        # word the robot can hear. Bound it: a late personality is better than
-        # a robot that never starts listening.
-        agent_context = None
-        if self.openclaw_bridge and self.openclaw_bridge.is_connected:
-            logger.info(
-                "Fetching agent context from OpenClaw (max %ds)...",
-                config.OPENCLAW_CONTEXT_TIMEOUT,
+
+            # Upgrade to the OpenClaw personality in the background.
+            personality = asyncio.create_task(
+                self._apply_openclaw_personality(conn), name="openclaw-personality"
             )
             try:
-                agent_context = await asyncio.wait_for(
-                    self.openclaw_bridge.get_agent_context(),
-                    timeout=config.OPENCLAW_CONTEXT_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "OpenClaw context fetch timed out after %ds — starting with "
-                    "the fallback identity. Raise OPENCLAW_CONTEXT_TIMEOUT, or "
-                    "point the agent at a faster model, to keep the OpenClaw "
-                    "personality.",
-                    config.OPENCLAW_CONTEXT_TIMEOUT,
-                )
+                # Process events
+                async for event in conn:
+                    await self._handle_event(event)
+            finally:
+                personality.cancel()
 
+    async def _apply_openclaw_personality(self, conn: Any) -> None:
+        """Fetch OpenClaw's identity and swap it in once it arrives.
 
-        if agent_context:
-            self._agent_context = agent_context
-            logger.info("Using OpenClaw agent context (%d chars)", len(agent_context))
-            # Combine OpenClaw's identity/context with robot body instructions
-            identity = agent_context
+        Runs while the robot is already listening, so the wait costs nothing.
+        Until it lands the robot answers as itself with the built-in identity;
+        after it lands it answers with the user's own agent context.
+        """
+        try:
+            context = await self._fetch_agent_context()
+            if not context:
+                return
+            await conn.session.update(
+                session={
+                    "type": "realtime",
+                    "instructions": self._compose_instructions(context),
+                }
+            )
+            logger.info(
+                "OpenClaw personality applied (%d chars) — robot was listening throughout",
+                len(context),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Could not apply OpenClaw personality: %s", e)
+    
+    # ------------------------------------------------------------------
+    # Direct MCP tools
+    # ------------------------------------------------------------------
+
+    async def start_mcp(self) -> None:
+        """Spawn the domain MCP server, if one is configured."""
+        if not config.MCP_SERVER_CMD:
+            return
+
+        from reachy_mini_openclaw.mcp_client import McpStdioClient
+
+        env: dict[str, str] = {}
+        if config.MCP_SERVER_ENV_FILE:
+            try:
+                with open(config.MCP_SERVER_ENV_FILE) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            env[k.strip()] = v.strip().strip('"').strip("'")
+            except OSError as e:
+                logger.warning("Could not read MCP_SERVER_ENV_FILE: %s", e)
+
+        client = McpStdioClient(
+            command=config.MCP_SERVER_CMD,
+            args=[a for a in config.MCP_SERVER_ARGS.split() if a],
+            cwd=config.MCP_SERVER_CWD or None,
+            env=env,
+        )
+        if await client.start():
+            self.mcp = client
         else:
-            logger.warning("Could not fetch OpenClaw context, using fallback identity")
-            identity = FALLBACK_IDENTITY
+            logger.warning("Direct MCP server unavailable — falling back to ask_openclaw")
 
+    async def stop_mcp(self) -> None:
+        if self.mcp is not None:
+            await self.mcp.stop()
+            self.mcp = None
+
+    def _mcp_tool_specs(self) -> list[dict]:
+        """Realtime tool specs for the allowlisted MCP tools."""
+        if self.mcp is None or not self.mcp.tools:
+            return []
+
+        allow = {t.strip() for t in config.MCP_TOOLS.split(",") if t.strip()}
+        prefix = config.MCP_TOOL_PREFIX
+        specs = []
+        for tool in self.mcp.tools:
+            raw = tool.get("name", "")
+            if allow and raw not in allow:
+                continue
+            specs.append(
+                {
+                    "type": "function",
+                    "name": f"{prefix}{raw}",
+                    "description": tool.get("description") or raw,
+                    "parameters": tool.get("inputSchema")
+                    or {"type": "object", "properties": {}},
+                }
+            )
+        self._mcp_tool_names = {s["name"] for s in specs}
+        logger.info(
+            "Exposing %d MCP tools directly: %s",
+            len(specs),
+            ", ".join(sorted(self._mcp_tool_names)) or "-",
+        )
+        return specs
+
+    async def _handle_mcp_tool(self, tool_name: str, args_json: str) -> dict:
+        """Run an allowlisted MCP tool and hand the text back to the model."""
+        if self.mcp is None or not self.mcp.is_running:
+            return {"error": "Data server unavailable. Say you cannot reach it right now."}
+        raw_name = tool_name[len(config.MCP_TOOL_PREFIX) :]
+        try:
+            args = json.loads(args_json) if args_json else {}
+        except json.JSONDecodeError:
+            args = {}
+        try:
+            text = await self.mcp.call_tool(raw_name, args)
+        except Exception as e:
+            logger.error("MCP tool '%s' failed: %s", raw_name, e)
+            return {"error": str(e)}
+        return {"result": text}
+
+    async def _fetch_agent_context(self) -> Optional[str]:
+        """Ask OpenClaw for the agent's identity, memories and user context.
+
+        A full OpenClaw agent turn, so as slow as whatever model that agent
+        runs. Bounded, and called off the startup path.
+        """
+        if not (self.openclaw_bridge and self.openclaw_bridge.is_connected):
+            return None
+
+        logger.info(
+            "Fetching agent context from OpenClaw in background (max %ds)...",
+            config.OPENCLAW_CONTEXT_TIMEOUT,
+        )
+        try:
+            context = await asyncio.wait_for(
+                self.openclaw_bridge.get_agent_context(),
+                timeout=config.OPENCLAW_CONTEXT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "OpenClaw context fetch timed out after %ds — keeping the "
+                "built-in identity. Raise OPENCLAW_CONTEXT_TIMEOUT, or point "
+                "the agent at a faster model.",
+                config.OPENCLAW_CONTEXT_TIMEOUT,
+            )
+            return None
+
+        if context:
+            self._agent_context = context
+        return context
+
+    def _compose_instructions(self, identity: str) -> str:
+        """Wrap an identity with the robot body instructions and language rule."""
         return f"""{identity}
 
 {ROBOT_BODY_INSTRUCTIONS}{self._language_instruction()}"""
@@ -473,7 +593,10 @@ OpenClaw has access to many capabilities you don't have directly.""",
         self.deps.movement_manager.set_processing(True)
         
         try:
-            if tool_name == "ask_openclaw":
+            if tool_name in self._mcp_tool_names:
+                # Straight to the data server — no agent turn in between.
+                result = await self._handle_mcp_tool(tool_name, args_json)
+            elif tool_name == "ask_openclaw":
                 result = await self._handle_openclaw_query(args_json)
             else:
                 # Robot movement tools - dispatch locally

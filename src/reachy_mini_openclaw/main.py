@@ -511,6 +511,10 @@ class ClawBodyCore:
         logger.info("Ready! Speak to me...")
         
         # Start OpenAI handler in background
+        # Domain MCP server, if configured. Must be up before the Realtime
+        # session is built: its tools are advertised in that session.
+        await self.handler.start_mcp()
+
         handler_task = asyncio.create_task(self.handler.start_up(), name="openai-handler")
         
         # Start audio loops
@@ -535,6 +539,14 @@ class ClawBodyCore:
             if not task.done():
                 task.cancel()
                 
+        # Stop the MCP server subprocess, so it does not outlive us the way
+        # the OpenClaw bridge's copies did (557 orphans found once).
+        if getattr(self.handler, "mcp", None) is not None:
+            try:
+                asyncio.get_event_loop().run_until_complete(self.handler.stop_mcp())
+            except Exception as e:
+                logger.debug("MCP stop: %s", e)
+
         # Stop movement system
         self.head_wobbler.stop()
         self.movement_manager.stop()

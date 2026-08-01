@@ -23,6 +23,11 @@ class Config:
     OPENAI_API_KEY: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     OPENAI_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-realtime-1.5"))
     OPENAI_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
+    # Silence (ms) the server waits for before deciding your turn ended.
+    # Lower feels snappier; too low and it cuts you off on a pause.
+    VAD_SILENCE_MS: int = field(
+        default_factory=lambda: int(os.getenv("VAD_SILENCE_MS", "500"))
+    )
     # ISO-639-1 code ("fr", "en", …), or empty to let the model decide.
     # Worth setting: the agent context that seeds the session comes from
     # OpenClaw and may be short or in another language, in which case the
@@ -55,6 +60,24 @@ class Config:
     # Format: agent:<agent_id>:<session_key>, but we only need the session key part here
     OPENCLAW_SESSION_KEY: str = field(default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY", "main"))
     
+    # ── Direct MCP server (optional) ──
+    # Lets the robot query a domain MCP server itself instead of routing the
+    # question through an OpenClaw agent turn. The agent round trip exists to
+    # *choose* a tool; the Realtime model already chose it, so that trip is
+    # pure latency — measured 1-3 s here against 20-115 s through OpenClaw.
+    # Empty MCP_SERVER_CMD disables the whole feature.
+    MCP_SERVER_CMD: str = field(default_factory=lambda: os.getenv("MCP_SERVER_CMD", ""))
+    MCP_SERVER_ARGS: str = field(default_factory=lambda: os.getenv("MCP_SERVER_ARGS", ""))
+    MCP_SERVER_CWD: str = field(default_factory=lambda: os.getenv("MCP_SERVER_CWD", ""))
+    # .env file to hand to the MCP server (its DATABASE_URL and friends).
+    MCP_SERVER_ENV_FILE: str = field(default_factory=lambda: os.getenv("MCP_SERVER_ENV_FILE", ""))
+    # Prefix keeps these apart from the robot's own tools in the session.
+    MCP_TOOL_PREFIX: str = field(default_factory=lambda: os.getenv("MCP_TOOL_PREFIX", "wedding_"))
+    # Comma-separated allowlist. Empty exposes every tool the server advertises
+    # — usually a bad trade: each schema costs prompt tokens and blurs the
+    # model's choice. Name the handful worth answering instantly.
+    MCP_TOOLS: str = field(default_factory=lambda: os.getenv("MCP_TOOLS", ""))
+
     # Robot Configuration
     ROBOT_NAME: Optional[str] = field(default_factory=lambda: os.getenv("ROBOT_NAME"))
     # Hostname of the daemon, used when REACHY_CONNECTION_MODE is "network"
