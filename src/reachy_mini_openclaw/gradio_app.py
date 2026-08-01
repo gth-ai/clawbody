@@ -174,7 +174,11 @@ def launch_gradio(
         chat = gr.update(value=msgs)
 
         err_box = gr.update(value=err or "", visible=bool(err))
-        return strip, health, chat, err_box
+        # Les boutons se déduisent de l'état réel, pas du dernier clic reçu :
+        # un onglet ouvert après le démarrage, un rechargement de page, ou un
+        # démarrage venu d'ailleurs laissaient sinon des contrôles faux —
+        # « Arrêter » grisé alors que le robot tourne.
+        return strip, health, chat, err_box, *_controls(running=running)
 
     def refresh_camera():
         instance = app["instance"]
@@ -343,7 +347,8 @@ Ces valeurs viennent de `.env` — modifie-le puis redémarre.
         )
 
         gr.Timer(STATE_REFRESH_S).tick(
-            refresh, outputs=[phase_strip, health_strip, chat, error_box]
+            refresh,
+            outputs=[phase_strip, health_strip, chat, error_box, start_btn, stop_btn],
         )
         if enable_camera:
             gr.Timer(CAMERA_REFRESH_S).tick(refresh_camera, outputs=[camera])

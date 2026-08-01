@@ -60,3 +60,4 @@ Thumbs.db
 
 # Package manager
 uv.lock
+.gstack/
