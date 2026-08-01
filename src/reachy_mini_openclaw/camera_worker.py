@@ -22,6 +22,7 @@ from scipy.spatial.transform import Rotation as R
 from reachy_mini import ReachyMini
 from reachy_mini.utils.interpolation import linear_pose_interpolation
 
+from reachy_mini_openclaw import ui_state
 from reachy_mini_openclaw.config import config
 
 
@@ -247,10 +248,9 @@ class CameraWorker:
                 self._loop_count += 1
                 now = time.time()
                 if now - self._rate_report_time >= 10.0:
-                    logger.info(
-                        "Face tracking loop: %.1f Hz",
-                        self._loop_count / (now - self._rate_report_time),
-                    )
+                    hz = self._loop_count / (now - self._rate_report_time)
+                    logger.info("Face tracking loop: %.1f Hz", hz)
+                    ui_state.STATE.update_health(tracking_hz=hz)
                     self._loop_count = 0
                     self._rate_report_time = now
 

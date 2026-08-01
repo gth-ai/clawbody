@@ -28,6 +28,7 @@ from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item
 from scipy.signal import resample
 from websockets.exceptions import ConnectionClosedError
 
+from reachy_mini_openclaw import ui_state
 from reachy_mini_openclaw.config import config
 from reachy_mini_openclaw.prompts import get_session_voice
 from reachy_mini_openclaw.tools.core_tools import ToolDependencies, get_tool_specs, dispatch_tool_call
@@ -296,6 +297,9 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 },
             )
             logger.info("OpenAI Realtime session configured with %d tools", len(tools))
+            ui_state.STATE.update_health(
+                realtime=True, mcp_tools=len(self._mcp_tool_names)
+            )
 
             self.connection = conn
             self._connected_event.set()
@@ -500,6 +504,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 self.deps.head_wobbler.reset()
             self.deps.movement_manager.set_listening(True)
             logger.info("User started speaking (flushed %d audio chunks)", flushed)
+            ui_state.STATE.set_phase(ui_state.PHASE_LISTENING)
             
         if event_type == "input_audio_buffer.speech_stopped":
             self.deps.movement_manager.set_listening(False)
@@ -510,6 +515,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             transcript = event.transcript
             if transcript and transcript.strip():
                 logger.info("User: %s", transcript)
+                ui_state.STATE.add_turn("user", transcript)
                 self._last_user_message = transcript  # Track for sync
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "user", "content": transcript})
@@ -518,6 +524,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
         # Response started - robot is about to speak
         if event_type == "response.created":
             self._speaking = True
+            ui_state.STATE.set_phase(ui_state.PHASE_SPEAKING)
             logger.debug("Response started")
             
         # Audio output from TTS.
@@ -551,6 +558,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             response_text = event.transcript
             logger.info("Assistant: %s", response_text[:100] if len(response_text) > 100 else response_text)
             self._last_assistant_response = response_text  # Track for sync
+            ui_state.STATE.add_turn("assistant", response_text)
             await self.output_queue.put(
                 AdditionalOutputs({"role": "assistant", "content": response_text})
             )
@@ -558,6 +566,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
         # Response completed - sync conversation to OpenClaw
         if event_type == "response.done":
             self._speaking = False
+            ui_state.STATE.set_phase(ui_state.PHASE_IDLE)
             self.deps.movement_manager.set_processing(False)
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
@@ -591,6 +600,12 @@ OpenClaw has access to many capabilities you don't have directly.""",
         # Start thinking animation while we process the tool call.
         # It will stop when the next audio delta arrives or response completes.
         self.deps.movement_manager.set_processing(True)
+        ui_state.STATE.set_phase(
+            ui_state.PHASE_THINKING,
+            {"ask_openclaw": "interroge OpenClaw"}.get(
+                tool_name, tool_name.replace(config.MCP_TOOL_PREFIX, "").replace("_", " ")
+            ),
+        )
         
         try:
             if tool_name in self._mcp_tool_names:

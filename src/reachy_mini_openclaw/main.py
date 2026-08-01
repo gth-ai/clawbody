@@ -28,6 +28,8 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from reachy_mini_openclaw import ui_state
+
 # Load environment from project root (override=True ensures .env takes precedence)
 _project_root = Path(__file__).parent.parent.parent
 load_dotenv(_project_root / ".env", override=True)
@@ -462,6 +464,7 @@ class ClawBodyCore:
             connected = await self.openclaw_bridge.connect()
             if connected:
                 logger.info("OpenClaw gateway connected")
+                ui_state.STATE.update_health(openclaw=True)
             else:
                 logger.warning("OpenClaw gateway not available - some features disabled")
         
@@ -479,6 +482,7 @@ class ClawBodyCore:
             )
             time.sleep(2)  # Wait for goto to complete
             logger.info("Robot at neutral position with motors enabled")
+            ui_state.STATE.update_health(robot=True)
         except Exception as e:
             logger.error("Failed to initialize robot pose: %s", e)
         
@@ -496,6 +500,7 @@ class ClawBodyCore:
         if self.camera_worker is not None:
             logger.info("Starting camera worker...")
             self.camera_worker.start()
+            ui_state.STATE.update_health(camera=True)
         
         # Start local vision processor if available
         if self.vision_manager is not None:
@@ -509,6 +514,9 @@ class ClawBodyCore:
         time.sleep(1)  # Let pipelines initialize
         
         logger.info("Ready! Speak to me...")
+        ui_state.STATE.set_running(True)
+        # Expose the loop so the UI can apply a personality mid-conversation.
+        self._loop = asyncio.get_running_loop()
         
         # Start OpenAI handler in background
         # Domain MCP server, if configured. Must be up before the Realtime
