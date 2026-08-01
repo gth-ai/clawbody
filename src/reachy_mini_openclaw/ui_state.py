@@ -24,6 +24,10 @@ PHASE_LISTENING = "listening"
 PHASE_THINKING = "thinking"
 PHASE_SPEAKING = "speaking"
 
+# La boucle de suivi publie sa cadence toutes les 10 s ; au-delà de ce délai
+# on considère la mesure périmée plutôt que de réafficher l'ancienne.
+TRACKING_STALE_S = 30.0
+
 
 @dataclass
 class Health:
@@ -52,6 +56,7 @@ class UiState:
     _detail: str = ""
 
     _health: Health = field(default_factory=Health)
+    _tracking_seen: float = 0.0
     _error: Optional[str] = None
     _running: bool = False
     _started_at: Optional[float] = None
@@ -102,10 +107,19 @@ class UiState:
             for k, v in kwargs.items():
                 if hasattr(self._health, k):
                     setattr(self._health, k, v)
+            if "tracking_hz" in kwargs:
+                self._tracking_seen = time.monotonic()
 
     def health(self) -> Health:
         with self._lock:
-            return Health(**vars(self._health))
+            h = Health(**vars(self._health))
+            # Le taux de suivi est une mesure, pas un drapeau : la boucle le
+            # publie toutes les 10 s. Passé ce délai, on ne sait plus à quelle
+            # cadence elle tourne — ni même si elle tourne. Afficher la
+            # dernière valeur connue reviendrait à inventer.
+            if time.monotonic() - self._tracking_seen > TRACKING_STALE_S:
+                h.tracking_hz = 0.0
+            return h
 
     def set_running(self, running: bool) -> None:
         with self._lock:
@@ -114,6 +128,12 @@ class UiState:
             if not running:
                 self._phase = PHASE_IDLE
                 self._detail = ""
+                # La santé décrit une conversation en cours. À l'arrêt, la
+                # garder telle quelle afficherait des pastilles vertes pour
+                # des sous-systèmes éteints — robot déconnecté, caméra sans
+                # flux — c'est-à-dire un état passé présenté comme actuel.
+                self._health = Health()
+                self._tracking_seen = 0.0
 
     def running(self) -> tuple[bool, float]:
         with self._lock:
@@ -142,6 +162,7 @@ class UiState:
             self._running = False
             self._started_at = None
             self._health = Health()
+            self._tracking_seen = 0.0
 
 
 # One instance for the process. The UI and the conversation thread both import

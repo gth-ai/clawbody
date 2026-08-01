@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # quelques champs) ; la caméra l'est moins, on l'espace.
 STATE_REFRESH_S = 0.5
 CAMERA_REFRESH_S = 0.2
+# Sondage des sous-systèmes hors conversation : assez fréquent pour être utile,
+# assez espacé pour ne pas marteler le daemon et la passerelle.
+PROBE_EVERY_S = 10.0
 
 PHASE_LABELS = {
     ui_state.PHASE_IDLE: ("💤", "Au repos"),
@@ -137,6 +140,49 @@ def launch_gradio(
     # Rafraîchissement
     # ------------------------------------------------------------------
 
+    # Sondes hors conversation. Les indicateurs de santé ne sont alimentés que
+    # pendant un run : robot et openclaw restaient donc gris même quand ils
+    # tournaient, simplement parce qu'on ne les avait pas encore interrogés.
+    # Ici on les teste directement, ce qui donne une réponse valable à l'arrêt.
+    probe_cache = {"at": 0.0, "robot": False, "openclaw": False}
+
+    def probe_idle():
+        import socket
+        import time as _t
+        import urllib.request
+
+        if _t.monotonic() - probe_cache["at"] < PROBE_EVERY_S:
+            return probe_cache
+        probe_cache["at"] = _t.monotonic()
+
+        # Le robot : le port peut être ouvert alors que le backend est arrêté
+        # — c'est le cas quand le daemon tourne sans robot actif. Un simple
+        # test TCP afficherait vert à tort ; on lit donc l'état déclaré.
+        robot_ok = False
+        try:
+            url = f"http://{config.REACHY_HOST}:8000/api/daemon/status"
+            with urllib.request.urlopen(url, timeout=2) as r:
+                import json as _j
+
+                robot_ok = _j.loads(r.read()).get("state") == "running"
+        except Exception:
+            robot_ok = False
+        probe_cache["robot"] = robot_ok
+
+        # La passerelle : un port ouvert suffit ici, le protocole n'est pas
+        # interrogeable sans s'authentifier.
+        oc_ok = False
+        try:
+            from urllib.parse import urlparse
+
+            u = urlparse(gateway_url.replace("ws://", "http://").replace("wss://", "https://"))
+            with socket.create_connection((u.hostname or "127.0.0.1", u.port or 18789), timeout=2):
+                oc_ok = True
+        except Exception:
+            oc_ok = False
+        probe_cache["openclaw"] = oc_ok
+        return probe_cache
+
     def refresh():
         phase, detail, since = state.phase()
         running, uptime = state.running()
@@ -153,14 +199,31 @@ def launch_gradio(
         strip = f"<div class='phase-strip'>{icon} {label}</div>"
 
         def dot(ok: bool) -> str:
-            return "🟢" if ok else "⚪"
+            return "🟢" if ok else "🔴"
+
+        if running:
+            robot_dot, oc_dot = dot(h.robot), dot(h.openclaw)
+            # Ces quatre-là n'existent qu'à l'intérieur d'une conversation.
+            rt = f"{dot(h.realtime)} realtime"
+            mcp = f"{dot(h.mcp_tools > 0)} mcp ({h.mcp_tools})"
+            cam = f"{dot(h.camera)} caméra"
+            trk = f"{dot(h.tracking_hz > 0)} suivi {h.tracking_hz:.0f} Hz"
+        else:
+            p = probe_idle()
+            robot_dot, oc_dot = dot(p["robot"]), dot(p["openclaw"])
+            # Gris neutre plutôt que rouge : à l'arrêt ils ne sont pas « en
+            # panne », ils sont sans objet. Les afficher en rouge inventerait
+            # une panne, exactement l'inverse du vert qui inventait une santé.
+            rt, mcp, cam, trk = (
+                "⚪ realtime",
+                "⚪ mcp",
+                "⚪ caméra",
+                "⚪ suivi",
+            )
 
         health = (
-            f"{dot(h.robot)} robot &nbsp; {dot(h.openclaw)} openclaw &nbsp; "
-            f"{dot(h.realtime)} realtime &nbsp; "
-            f"{dot(h.mcp_tools > 0)} mcp ({h.mcp_tools}) &nbsp; "
-            f"{dot(h.camera)} caméra &nbsp; "
-            f"{dot(h.tracking_hz > 0)} suivi {h.tracking_hz:.0f} Hz"
+            f"{robot_dot} robot &nbsp; {oc_dot} openclaw &nbsp; "
+            f"{rt} &nbsp; {mcp} &nbsp; {cam} &nbsp; {trk}"
         )
         if running and uptime > 0:
             health += f" &nbsp;·&nbsp; {int(uptime // 60)} min {int(uptime % 60):02d} s"
