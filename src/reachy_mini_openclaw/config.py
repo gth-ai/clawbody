@@ -121,7 +121,16 @@ class Config:
     MIC_MIN_RMS: float = field(
         default_factory=lambda: float(os.getenv("MIC_MIN_RMS", "0.02"))
     )
-    
+    # Avance maximale, en secondes, entre ce qui a été remis au robot et ce
+    # qu'il a fini de dire. OpenAI génère la parole beaucoup plus vite que le
+    # temps réel ; sans plafond, tout part d'un coup dans la file de lecture et
+    # le robot répond avec le retard ainsi accumulé (21 s mesurés). Descendre
+    # rend l'interruption plus franche mais expose aux à-coups réseau, puisque
+    # le robot a moins d'avance devant lui.
+    SPEECH_LEAD_S: float = field(
+        default_factory=lambda: float(os.getenv("SPEECH_LEAD_S", "1.5"))
+    )
+
     # Face Tracking Configuration
     # Options: "yolo", "mediapipe", or None for auto-detect
     HEAD_TRACKER_TYPE: Optional[str] = field(default_factory=lambda: os.getenv("HEAD_TRACKER_TYPE", "yolo"))

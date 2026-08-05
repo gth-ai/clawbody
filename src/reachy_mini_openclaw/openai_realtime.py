@@ -144,6 +144,10 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         # garde pour ne le journaliser qu'une fois par tour de parole.
         self._t_speech_stopped = 0.0
         self._first_audio_logged = False
+        # Incrémenté à chaque purge de la parole en attente. `play_loop` s'en
+        # sert pour savoir qu'un morceau retenu appartient à une réponse
+        # abandonnée entre-temps.
+        self.speech_generation = 0
         # Optional direct MCP server, set up by start_mcp().
         self.mcp: Optional[Any] = None
         self._mcp_tool_names: set[str] = set()
@@ -786,13 +790,17 @@ OpenClaw has access to many capabilities you don't have directly.""",
         loops for as long as that takes — on the one event where latency is
         most visible.
         """
+        # Avant le retour anticipé plus bas : la parole retenue par la
+        # contre-pression doit être abandonnée quel que soit le backend audio,
+        # y compris ceux qui n'exposent pas de purge.
+        self.speech_generation += 1
+        self._speaker_busy_until = 0.0
+
         audio = getattr(getattr(self.deps.robot, "media", None), "audio", None)
         clear = getattr(audio, "clear_player", None)
         if clear is None:
             # LOCAL/IPC audio backends buffer far less and expose no flush.
             return
-
-        self._speaker_busy_until = 0.0
 
         def _clear() -> None:
             try:
@@ -812,6 +820,15 @@ OpenClaw has access to many capabilities you don't have directly.""",
         """
         now = time.monotonic()
         self._speaker_busy_until = max(now, self._speaker_busy_until) + seconds
+
+    def speech_backlog(self) -> float:
+        """Secondes de parole déjà remises au robot qu'il n'a pas fini de dire.
+
+        Le même compteur que la suppression d'écho, lu ici pour cadencer
+        l'envoi : tant qu'il reste de l'avance, rien ne presse d'en pousser
+        davantage.
+        """
+        return max(0.0, self._speaker_busy_until - time.monotonic())
 
     def _robot_is_talking(self) -> bool:
         """True while the robot's own voice is still reaching its microphone."""

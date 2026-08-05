@@ -423,7 +423,23 @@ class ClawBodyCore:
                 await asyncio.sleep(0.005)
             
     async def play_loop(self) -> None:
-        """Play audio from handler through robot speakers."""
+        """Play audio from handler through robot speakers.
+
+        OpenAI produit la parole bien plus vite que le temps réel : plus de
+        20 s d'audio peuvent arriver en 5 s. `push_audio_sample()` ne bloque
+        pas, si bien que tout partait aussitôt dans GStreamer, qui le jouait
+        ensuite à vitesse normale. Le robot répondait donc avec le retard
+        accumulé (21 s mesurés sur une conversation), et les rafales de
+        décodage privaient le keepalive du WebSocket de temps de calcul assez
+        longtemps pour que la session tombe.
+
+        On ne pousse donc au robot que ce qu'il peut jouer sous peu. Le reste
+        attend dans la file du handler, d'où le barge-in le purge déjà : une
+        interruption reste immédiate, et ce qui n'a pas été poussé n'a même
+        pas besoin d'être rattrapé.
+        """
+        from reachy_mini_openclaw.config import config
+
         output_sr = self.robot.media.get_output_audio_samplerate()
         logger.info("Playing at %d Hz", output_sr)
 
@@ -436,6 +452,20 @@ class ClawBodyCore:
             if output is not None:
                 if isinstance(output, tuple):
                     input_sr, audio_data = output
+
+                    # Attendre que l'avance retombe sous le seuil, par petits
+                    # pas pour rester réactif.
+                    generation = self.handler.speech_generation
+                    while (
+                        self.handler.speech_backlog() > config.SPEECH_LEAD_S
+                        and not self._should_stop()
+                    ):
+                        await asyncio.sleep(0.05)
+                    if self.handler.speech_generation != generation:
+                        # Interruption pendant l'attente : ce morceau appartient
+                        # à une réponse que l'utilisateur a coupée. Le jouer
+                        # maintenant ferait reprendre une phrase abandonnée.
+                        continue
 
                     # Convert to float32 and normalize (OpenAI sends int16)
                     audio_data = audio_data.flatten().astype("float32") / 32768.0
