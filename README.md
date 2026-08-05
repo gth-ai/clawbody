@@ -380,6 +380,33 @@ VAD_SILENCE_MS=300
 Si le délai dépasse plusieurs secondes, cherche plutôt du côté de la charge
 machine (voir ci-dessous).
 
+### Le robot répond à ce que tu disais il y a vingt secondes
+
+Symptôme différent du précédent : la première syllabe arrive vite, mais le
+contenu est en retard d'un ou plusieurs tours de parole.
+
+OpenAI génère la parole beaucoup plus vite que le temps réel (26 s d'audio
+reçues en 9 s, mesuré ici) et `push_audio_sample()` ne bloque pas. Tout
+partait donc d'un coup dans la file GStreamer, que le robot jouait ensuite à
+vitesse normale : le retard s'accumulait d'un tour à l'autre, jusqu'à 21 s.
+
+`play_loop` plafonne maintenant cette avance à `SPEECH_LEAD_S` (1,5 s par
+défaut). Pour diagnostiquer, compare le temps réel écoulé aux secondes
+d'audio poussées :
+
+```bash
+grep "Audio out:" clawbody.log | tail -20
+```
+
+Si le cumul progresse nettement plus vite que l'horloge, le retard se
+reconstitue et `SPEECH_LEAD_S` mérite d'être baissé. Attention : une valeur
+trop basse laisse moins de marge aux à-coups réseau, le robot ayant moins
+d'avance devant lui.
+
+Ce même emballement expliquait les `keepalive ping timeout` : pendant les
+rafales, la tâche keepalive du WebSocket ne reprenait pas la main avant les
+20 s de `ping_timeout`.
+
 ### `Session error: WebSocket connection closed with unsent messages`
 
 Arrive quand tu coupes la parole au robot. ClawBody envoie désormais
