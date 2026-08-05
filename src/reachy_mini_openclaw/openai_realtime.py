@@ -254,6 +254,14 @@ OpenClaw has access to many capabilities you don't have directly.""",
         model = config.OPENAI_MODEL
         logger.info("Connecting to OpenAI Realtime API with model: %s", model)
 
+        # Une session neuve n'a jamais de réponse en cours. Sans cette remise
+        # à zéro, `_speaking` gardait la valeur laissée par la session
+        # précédente : quand celle-ci tombe pendant que le robot parle, son
+        # `response.done` n'arrive jamais, et le premier mot prononcé après la
+        # reconnexion déclenchait une annulation dans le vide
+        # (`response_cancel_not_active`).
+        self._speaking = False
+
         # Start with the built-in identity so the robot can listen right away.
         # Fetching the OpenClaw personality is a full agent turn — tens of
         # seconds — and it used to sit between "Ready!" and the first word the
@@ -618,7 +626,13 @@ OpenClaw has access to many capabilities you don't have directly.""",
             err = getattr(event, "error", None)
             msg = getattr(err, "message", str(err))
             code = getattr(err, "code", "")
-            logger.error("OpenAI error [%s]: %s", code, msg)
+            if code == "response_cancel_not_active":
+                # Course inévitable : on annule sur la foi de notre propre
+                # état, et la réponse a pu se terminer entre-temps. Il n'y a
+                # rien à réparer, l'interruption a bien eu lieu.
+                logger.debug("Annulation sans objet : la réponse était déjà finie")
+            else:
+                logger.error("OpenAI error [%s]: %s", code, msg)
             
     async def _handle_tool_call(self, event: Any) -> None:
         """Handle a tool call from OpenAI."""
