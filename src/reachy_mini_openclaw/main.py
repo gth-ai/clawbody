@@ -395,15 +395,32 @@ class ClawBodyCore:
         return False
         
     async def record_loop(self) -> None:
-        """Read audio from robot microphone and send to handler."""
+        """Read audio from robot microphone and send to handler.
+
+        `get_audio_sample()` descend sur `try_pull_sample(20 ms)` : l'appel
+        bloque jusqu'à 20 ms en attendant une trame, et il le faisait ici dans
+        l'event loop. Le `sleep(0.01)` qui suivait s'ajoutait à cette attente,
+        pour un micro qui produit une trame toutes les ~12 ms : la boucle ne
+        pouvait pas suivre. L'appsink est en `drop=True`, donc le surplus était
+        jeté (les plus vieilles trames en premier). Mesuré sur le robot :
+        ratio de 0,83 avec le sleep, 1,00 sans. La voix arrivait hachée à
+        OpenAI, qui n'y reconnaissait plus de parole.
+
+        La lecture part donc dans un thread : elle garde son attente bloquante,
+        qui sert ici de cadencement, mais ne gèle plus `play_loop` avec elle.
+        """
         input_sr = self.robot.media.get_input_audio_samplerate()
         logger.info("Recording at %d Hz", input_sr)
-        
+
         while not self._should_stop():
-            audio_frame = self.robot.media.get_audio_sample()
+            audio_frame = await asyncio.to_thread(self.robot.media.get_audio_sample)
             if audio_frame is not None:
                 await self.handler.receive((input_sr, audio_frame))
-            await asyncio.sleep(0.01)
+            else:
+                # Pas de trame après 20 ms d'attente : le micro est muet ou
+                # la connexion est tombée. Rendre la main évite de tourner à
+                # vide sur le thread.
+                await asyncio.sleep(0.005)
             
     async def play_loop(self) -> None:
         """Play audio from handler through robot speakers."""
@@ -454,8 +471,10 @@ class ClawBodyCore:
                             pushed_seconds,
                         )
                 # else: it's an AdditionalOutputs (transcript) - handle in UI mode
-                
-            await asyncio.sleep(0.01)
+
+            # Pas de `sleep` ici : `emit()` attend déjà jusqu'à 100 ms sur la
+            # file et rend la main dès qu'une trame arrive. En ajouter un ne
+            # faisait que retarder d'autant chaque morceau de parole.
             
     async def run(self) -> None:
         """Run the main application loop."""

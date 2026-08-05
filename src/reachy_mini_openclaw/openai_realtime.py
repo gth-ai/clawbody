@@ -140,6 +140,10 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         # Running estimate of how loud the robot's own voice comes back into
         # its microphone, used to tell echo apart from someone talking over it.
         self._echo_rms = 0.0
+        # Mesure du délai de réponse : instant où l'utilisateur s'est tu, et
+        # garde pour ne le journaliser qu'une fois par tour de parole.
+        self._t_speech_stopped = 0.0
+        self._first_audio_logged = False
         # Optional direct MCP server, set up by start_mcp().
         self.mcp: Optional[Any] = None
         self._mcp_tool_names: set[str] = set()
@@ -508,6 +512,11 @@ OpenClaw has access to many capabilities you don't have directly.""",
             
         if event_type == "input_audio_buffer.speech_stopped":
             self.deps.movement_manager.set_listening(False)
+            # Point de départ du délai de réponse : c'est l'instant où l'on se
+            # tait, pas celui où le serveur ouvre la réponse. « C'est lent »
+            # n'est exploitable qu'avec ce repère.
+            self._t_speech_stopped = time.monotonic()
+            self._first_audio_logged = False
             logger.info("User stopped speaking")
             
         # Transcription (for logging, UI, and sync)
@@ -534,7 +543,17 @@ OpenClaw has access to many capabilities you don't have directly.""",
         if event_type == "response.output_audio.delta":
             # Audio arriving means we have a response - stop thinking animation
             self.deps.movement_manager.set_processing(False)
-            
+
+            # Délai perçu : du silence de l'utilisateur au premier son du
+            # robot. Une seule ligne par tour de parole, sur le premier
+            # morceau (les suivants arrivent en rafale et ne disent rien).
+            if not self._first_audio_logged and self._t_speech_stopped:
+                self._first_audio_logged = True
+                logger.info(
+                    "Réponse en %.2f s (silence → premier son)",
+                    time.monotonic() - self._t_speech_stopped,
+                )
+
             # Feed to head wobbler for expressive movement
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.feed(event.delta)
