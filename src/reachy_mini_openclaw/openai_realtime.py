@@ -494,8 +494,23 @@ OpenClaw has access to many capabilities you don't have directly.""",
             # while it is talking and discards the rest of the reply, so the
             # count is logged: a steady stream of large flushes means the
             # speaker is feeding back into the mic.
+            was_speaking = self._speaking
             self._speaking = False
             self.deps.movement_manager.set_processing(False)
+
+            # Dire au serveur d'arrêter de produire, et pas seulement jeter ce
+            # qu'il a déjà envoyé. Sans ça, il continuait de pousser l'audio
+            # d'une réponse que plus personne n'écoutait : la connexion
+            # finissait par tomber sur « closed with unsent messages », ce qui
+            # coûtait une reconnexion complète (~2 s) à chaque interruption.
+            # Conditionné à une réponse réellement en cours : annuler dans le
+            # vide fait répondre une erreur au serveur.
+            if was_speaking and self.connection is not None:
+                try:
+                    await self.connection.response.cancel()
+                except Exception as e:
+                    logger.debug("Annulation de la réponse en cours : %s", e)
+
             self._drop_buffered_speech()
             flushed = 0
             while not self.output_queue.empty():

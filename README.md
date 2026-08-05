@@ -311,6 +311,115 @@ When running with the simulator:
 reachy-mini-daemon --sim --scene minimal
 ```
 
+## 🩺 Dépannage
+
+### Le robot ne réagit pas à la voix
+
+Vérifie d'abord ce que le journal montre, il départage les deux causes
+possibles :
+
+```bash
+grep -E "User:|Réponse en|Audio out" clawbody.log
+```
+
+- **Aucune ligne `User:`** : la parole n'atteint pas OpenAI. Mesure le micro
+  indépendamment (voir ci-dessous) ; s'il capte, c'est la boucle audio qui
+  perd des trames.
+- **Des lignes `User:` mais aucune `Audio out`** : la voix passe, c'est la
+  réponse qui ne sort pas. Regarde les `Session error` juste avant.
+
+Pour mesurer le micro sans OpenAI ni suivi de visage :
+
+```python
+import time, numpy as np
+from reachy_mini import ReachyMini
+
+with ReachyMini(host="reachy-mini.local") as m:
+    sr = m.media.get_input_audio_samplerate()
+    m.media.start_recording(); time.sleep(1)
+    t0, n, rms = time.monotonic(), 0, 0.0
+    while time.monotonic() - t0 < 10:      # parle pendant ce temps
+        a = m.media.get_audio_sample()
+        if a is not None:
+            n += len(a)
+            rms = max(rms, float(np.sqrt(np.mean(np.square(a)))))
+    d = time.monotonic() - t0
+    print(f"ratio={n/sr/d:.2f} (attendu ~1.0)  RMS_max={rms:.3f}")
+```
+
+Deux repères : le **ratio** doit valoir ~1,0 (nettement en dessous, des
+trames sont jetées) et le **RMS** doit dépasser `MIC_MIN_RMS` (0,02 par
+défaut) quand tu parles.
+
+> **Ne mets jamais de `sleep` dans la boucle de lecture du micro.**
+> `get_audio_sample()` descend sur `try_pull_sample(20 ms)`, qui attend déjà
+> une trame et cadence donc la boucle à lui seul. Toute attente ajoutée
+> passe sous le débit du micro (une trame toutes les ~12 ms) et l'appsink,
+> réglé en `drop=True`, jette le surplus. Mesuré sur le robot : un
+> `sleep(0.01)` faisait tomber le ratio à 0,83, soit 17 % de la voix perdue
+> avant même le réseau. Assez pour que le VAD serveur n'y reconnaisse plus
+> de parole, alors que le micro capte parfaitement.
+
+### Les réponses sont lentes
+
+Chaque tour de parole journalise son délai réel :
+
+```
+Réponse en 0.64 s (silence → premier son)
+```
+
+Ce délai inclut `VAD_SILENCE_MS` (500 ms par défaut), soit le temps que le
+serveur attend avant de te considérer comme ayant fini. Une valeur autour de
+0,6 à 0,9 s est normale. Pour gagner ~200 ms, au prix de coupures si tu
+marques des pauses au milieu de tes phrases :
+
+```bash
+VAD_SILENCE_MS=300
+```
+
+Si le délai dépasse plusieurs secondes, cherche plutôt du côté de la charge
+machine (voir ci-dessous).
+
+### `Session error: WebSocket connection closed with unsent messages`
+
+Arrive quand tu coupes la parole au robot. ClawBody envoie désormais
+`response.cancel` au serveur, qui cesse de produire de l'audio dont plus
+personne ne veut. La reconnexion automatique existe de toute façon (~2 s),
+donc une occurrence isolée reste sans conséquence.
+
+### Lenteur générale, ventilateurs, machine chargée
+
+ClawBody lance un serveur MCP par conversation. En cas d'arrêt brutal, ces
+serveurs survivent au processus. Pour vérifier :
+
+```bash
+pgrep -f "mcp/server.ts" | wc -l     # devrait être 0 à l'arrêt
+pgrep -lf "bin/clawbody"             # une seule instance attendue
+```
+
+Constaté en pratique : 95 serveurs orphelins et une instance ClawBody
+oubliée depuis trois jours (3,8 Go, 113 % de CPU en continu). Pour nettoyer :
+
+```bash
+pkill -f "bin/clawbody"; sleep 3; pkill -9 -f "mcp/server.ts"
+```
+
+Note que `SIGINT` ne suffit pas toujours à arrêter ClawBody : prévois un
+`SIGTERM` en second recours.
+
+### Messages normaux au démarrage
+
+Ceux-ci sont attendus et sans conséquence :
+
+- `No Reachy Mini Audio USB device found` : pas de carte son USB, bascule
+  sur l'audio système
+- `Class AVFFrameReceiver is implemented in both...` : `av` et `cv2`
+  embarquent chacun leur `libavdevice`
+- `OpenClaw context fetch timed out after 45s` : la récupération de la
+  personnalité est un tour d'agent complet (30 à 45 s). Elle tourne en
+  arrière-plan, le robot écoute pendant ce temps ; en cas d'échec il garde
+  son identité par défaut. Augmente `OPENCLAW_CONTEXT_TIMEOUT` si besoin.
+
 ## 📄 License
 
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
